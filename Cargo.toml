@@ -1,0 +1,13 @@
+[package]
+name = "tints-to-lunacy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+json            = "0.12"
+reqwest         = { version = "*", features = ["blocking"] }
+uuid            = { version = "1.16", features = ["v4"] }
+base64          = "*"
+tempdir         = "*"
+zip             = "*"
+zip-extensions  = "*"
