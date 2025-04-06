@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-json            = "0.12"
-reqwest         = { version = "*", features = ["blocking"] }
-uuid            = { version = "1.16", features = ["v4"] }
-base64          = "*"
-tempdir         = "*"
-zip             = "*"
-zip-extensions  = "*"
+json            = "0.12.4"
+reqwest         = { version = "0.12.15", features = ["blocking"] }
+uuid            = { version = "1.16.0", features = ["v4"] }
+base64          = "0.22.1"
+tempdir         = "0.3.7"
+zip             = "2.6.1"
+zip-extensions  = { git = "https://github.com/matzefriedrich/zip-extensions-rs", rev = "refs/pull/19/head"}
