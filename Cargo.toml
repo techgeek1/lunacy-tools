@@ -1,13 +1,14 @@
 [package]
-name = "tints-to-lunacy"
+name = "lunacy-tools"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+base64          = "0.22.1"
+clap            = { version = "4.5.35", features = ["cargo"] }
 json            = "0.12.4"
 reqwest         = { version = "0.12.15", features = ["blocking"] }
-uuid            = { version = "1.16.0", features = ["v4"] }
-base64          = "0.22.1"
 tempdir         = "0.3.7"
+uuid            = { version = "1.16.0", features = ["v4"] }
 zip             = "2.6.1"
-zip-extensions  = { git = "https://github.com/matzefriedrich/zip-extensions-rs", rev = "refs/pull/19/head"}
+zip-extensions  = { git = "https://github.com/matzefriedrich/zip-extensions-rs", rev = "refs/pull/19/head" }

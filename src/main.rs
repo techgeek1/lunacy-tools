@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use clap::{arg, command, value_parser, ArgMatches};
 use json::{JsonValue, object};
 use reqwest;
 use tempdir::TempDir;
@@ -13,42 +14,139 @@ const URL: &'static str = "https://www.tints.dev/api";
 /// A generic error type.
 type Error = Box<dyn std::error::Error>;
 
+fn parse_base_color(s: &str) -> Result<BaseColor, String> {
+    let mut segs    = s.split(':');
+    let name        = segs.next();
+    let value       = segs.next();
+    let step        = segs.next();
+
+    match (name, value, step) {
+        // At minimium we require a name and a value.
+        (Some(name), Some(value), None) => {
+            // Ensure the value is a hexadecimal value.
+            let _ = u32::from_str_radix(value, 16)
+                .map_err(|_| format!("'{value}' is not a hexadecimal color"))?;
+
+            Ok(BaseColor::new(name, value, 500))
+        },
+        // Explicit step values are also supported.
+        (Some(name), Some(value), Some(step)) => {
+            // Ensure the value is a hexadecimal value.
+            let _ = u32::from_str_radix(value, 16)
+                .map_err(|_| format!("'{value}' is not a hexadecimal color"))?;
+            let step = u32::from_str_radix(step, 16)
+                .map_err(|_| format!("'{step}' is not an unsigned integer"))?;
+
+            Ok(BaseColor::new(name, value, step))
+        },
+        // Everything else is an error.
+        _ => {
+            Err(format!("'{s}' is not a valid base color string, colors must be specified in '<name>:<hex>[:<step>]; format"))
+        }
+    }
+}
+
 fn main() {
-    // Get the program arguments.
-    let mut args = std::env::args();
-    // Skip the exe path.
-    args.next();
+    // Parse the program matches.
+    let matches = command!()
+        .arg(
+            arg!([FILE] "the lunacy .free file to process")
+                .required(true)
+                .value_parser(value_parser!(PathBuf))
+        )
+        .arg(
+            arg!(--group <GROUP> "set the group containing the colors to modify, defaults to 'theme' if unspecified")
+                .required(false)
+                .value_parser(value_parser!(String))
+        )
+        .arg(
+            arg!(--color <COLOR> "specify a color to modify in the color palette, explicit colors always take precedence")
+                .id("COLOR")
+                .required_unless_present("COLOR_SCHEME")
+                .value_parser(parse_base_color)
+                .value_terminator(";")
+        )
+        .arg(
+            arg!(--color_scheme <COLOR_SCHEME> "specify a json file containing a color scheme")
+                .id("COLOR_SCHEME")
+                .required_unless_present("COLOR")
+                .value_parser(value_parser!(PathBuf))
+        )
+        .get_matches();
     
     // Acquire the document to update from the program arguments.
-    let Some(path) = args.next() else {
+    let Some(path) = matches.get_one::<PathBuf>("FILE") else {
         panic!("expected .free document as first argument");
     };
 
-    // TODO: Take colors from command line or json file.
+    // Read out the group to modify, or default to 'theme'.
+    let group = matches.get_one::<String>("group")
+        .map(|x| x.to_owned())
+        .unwrap_or_else(|| String::from("theme"));
 
-    // Setup the base color scheme to use.
-    let scheme = Scheme {
-        colors: vec![
-            BaseColor::new("dark" , "1d2023", 500),
-            BaseColor::new("brand", "00fbb0", 500)
-        ]
-    };
+    // Parse the color scheme to modify.
+    let scheme = load_color_scheme(&matches);
 
+    // Bail with no errors if there are no colors to update.
+    if scheme.colors.is_empty() {
+        return;
+    }
+
+    // Update the document colors.
     let mut doc = LunacyDocument::open(&path)
         .expect("failed to open document");
 
-    doc.update_colors(&scheme)
+    doc.update_colors(&group, &scheme)
         .expect("failed to update colors in document");
     doc.commit()
         .expect("failed to commit changes to document");
 }
 
+/// Load the color scheme from the program arguments.
+fn load_color_scheme(matches: &ArgMatches) -> ColorScheme {
+    let mut scheme = ColorScheme { colors: vec![] };
+
+    // Load the JSON schema first if provided.
+    if let Some(colors_json) = matches.get_one::<PathBuf>("COLOR_SCHEME") {
+        if let Ok(json_str) = std::fs::read_to_string(colors_json) {
+            if let Ok(json) = json::parse(&json_str) {
+                for (name, color) in json.entries() {
+                    // `value` is required.
+                    let value = color["value"].as_str().unwrap();
+                    // `step` is optional and defaults to 500 if not present.
+                    let step  = color.has_key("step")
+                        .then(|| color["step"].as_u32().unwrap())
+                        .unwrap_or(500);
+
+                    scheme.colors.push(BaseColor {
+                        name    : name.to_owned(),
+                        value   : value.to_owned(),
+                        step    : step
+                    })
+                }
+            }
+        }
+    }
+
+    // Read out the colors from the command line and build a scheme.
+    //
+    // Command line colors always take precedence.
+    if let Some(colors) = matches.get_many::<BaseColor>("COLOR") {
+        for color in colors {
+            scheme.colors.push(color.clone());
+        }
+    }
+
+    scheme
+}
+
 /// A set of colors defining a color scheme to apply to a Lunacy document.
-struct Scheme {
+struct ColorScheme {
     /// A set of base colors to generate a color palette from.
     colors  : Vec<BaseColor>
 }
 
+#[derive(Clone)]
 struct BaseColor {
     /// The name of the color.
     name    : String,
@@ -85,7 +183,12 @@ impl ColorPalette {
             }
         }
         
-        self.colors.push(ColorTints::default());
+        let tints = ColorTints {
+            name    : name.to_owned(),
+            tints   : Vec::new()
+        };
+
+        self.colors.push(tints);
         self.colors.last_mut().unwrap()
     }
 }
@@ -142,16 +245,6 @@ struct Color {
 }
 
 impl Color {
-    /// Create a new color from a name and hex value.
-    fn new(name: &str, hex: &str) -> Self {
-        Self {
-            id      : Uuid::new_v4(),
-            version : 1,
-            name    : name.to_owned(),
-            value   : hex.to_owned()
-        }
-    }
-
     // Create a new color from a json representation.
     fn from_json(json: &JsonValue) -> Color {
         /// Decode a uuid from a lunacy id.
@@ -226,19 +319,17 @@ impl LunacyDocument {
     }
 
     /// Update colors in the document with the provided color scheme.
-    pub fn update_colors(&mut self, scheme: &Scheme) -> Result<(), Error> {
-        const SUBFOLDER: &'static str = "theme";
-
+    pub fn update_colors(&mut self, group: &str, scheme: &ColorScheme) -> Result<(), Error> {
         // Load the document and resolve any existing colors.
         let mut json    = self.load_json("document.json")?;
-        let mut palette = Self::parse_color_palette(&json, SUBFOLDER);
+        let mut palette = Self::parse_color_palette(&json, group);
 
         // Modify or extend the color palette as requested by the user.
         for base_color in scheme.colors.iter() {
             // TODO: Compute tints locally, there's no reason to call a webapi.
 
             // Acquire the tints from `tints.dev`.
-            let mut new_tints   = query_tints(SUBFOLDER, &base_color.name, &base_color.value)?;
+            let mut new_tints   = query_tints(group, &base_color.name, &base_color.value)?;
             let tints           = palette.find_or_insert(&base_color.name);
 
             // Update the tints in the palette by name.
@@ -246,7 +337,7 @@ impl LunacyDocument {
         }
 
         // Apply changes back to the JSON file.
-        Self::apply_color_palette(&mut json, &palette, SUBFOLDER)?;
+        Self::apply_color_palette(&mut json, &palette, group)?;
         self.save_json("document.json", &json)?;
 
         Ok(())
@@ -273,22 +364,23 @@ impl LunacyDocument {
         Ok(())
     }
 
-    /// Parse the color palette from a `document.json` file in the specified subfolder.
-    fn parse_color_palette(json: &JsonValue, subfolder: &str) -> ColorPalette {
+    /// Parse the color palette from a `document.json` file in the specified group.
+    fn parse_color_palette(json: &JsonValue, group: &str) -> ColorPalette {
         let color_variables = &json["colorVariables"];
         let mut palette     = ColorPalette::default();
 
+        let prefix          = format!("{group} / ");
         for i in 0..color_variables.len() {
             let color_var   = &color_variables[i];
             let color       = Color::from_json(&color_var);
 
-            // Skip any colors not in the desired subfolder.
-            if !color.name.starts_with(subfolder) {
+            // Skip any colors not in the desired group.
+            if !color.name.starts_with(&prefix) {
                 continue;
             } 
 
             // Get the plain color name without the prefix or suffix.
-            let color_name = color.name.strip_prefix(subfolder)
+            let color_name = color.name.strip_prefix(&prefix)
                 .unwrap()
                 .split('/')
                 .next()
@@ -305,9 +397,9 @@ impl LunacyDocument {
 
     /// Apply `palette` to a `document.json` file.
     fn apply_color_palette(
-        json        : &mut JsonValue,
-        palette     : &ColorPalette,
-        subfolder   : &str
+        json    : &mut JsonValue,
+        palette : &ColorPalette,
+        group   : &str
     )
         -> Result<(), Error>
     {
@@ -318,7 +410,7 @@ impl LunacyDocument {
         // Remove the old colors from the variable list.
         for color in palette.colors.iter() {
             // Remove any variables that start with our colors.
-            let prefix = format!("{subfolder} / {}", color.name);
+            let prefix = format!("{group} / {}", color.name);
             let mut i  = 0;
             while i < color_variables.len() {
                 if color_variables[i]["name"].as_str().unwrap().starts_with(&prefix) {
@@ -342,7 +434,7 @@ impl LunacyDocument {
 }
 
 /// Query the tints for `name` and `color` at step 500 and return the JSON result.
-fn query_tints(subfolder: &str, name: &str, hex: &str) -> Result<ColorTints, Error> {
+fn query_tints(group: &str, name: &str, hex: &str) -> Result<ColorTints, Error> {
     const STEPS: &'static [&'static str] = &[
         "100",
         "200",
@@ -368,7 +460,7 @@ fn query_tints(subfolder: &str, name: &str, hex: &str) -> Result<ColorTints, Err
         tints.push(Color {
             id      : Uuid::new_v4(),
             version : 1,
-            name    : format!("{subfolder} / {name} / {name}.{step}"),
+            name    : format!("{group} / {name} / {name}.{step}"),
             value   : color[*step].as_str().unwrap().trim_start_matches("#").to_owned()
         });
     }
