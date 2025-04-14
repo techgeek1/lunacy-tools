@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -10,38 +11,6 @@ use uuid::Uuid;
 
 /// A generic error type.
 type Error = Box<dyn std::error::Error>;
-
-fn parse_base_color(s: &str) -> Result<BaseColor, String> {
-    let mut segs    = s.split(':');
-    let name        = segs.next();
-    let value       = segs.next();
-    let stop        = segs.next();
-
-    match (name, value, stop) {
-        // At minimium we require a name and a value.
-        (Some(name), Some(value), None) => {
-            // Ensure the value is a hexadecimal value.
-            let _ = u32::from_str_radix(value, 16)
-                .map_err(|_| format!("'{value}' is not a hexadecimal color"))?;
-
-            Ok(BaseColor::new(name, value, 500))
-        },
-        // Explicit stop values are also supported.
-        (Some(name), Some(value), Some(stop)) => {
-            // Ensure the value is a hexadecimal value.
-            let _ = u32::from_str_radix(value, 16)
-                .map_err(|_| format!("'{value}' is not a hexadecimal color"))?;
-            let stop = u32::from_str_radix(stop, 16)
-                .map_err(|_| format!("'{stop}' is not an unsigned integer"))?;
-
-            Ok(BaseColor::new(name, value, stop))
-        },
-        // Everything else is an error.
-        _ => {
-            Err(format!("'{s}' is not a valid base color string, colors must be specified in '<name>:<hex>[:<stop>]; format"))
-        }
-    }
-}
 
 fn main() {
     // Parse the program matches.
@@ -57,16 +26,8 @@ fn main() {
                 .value_parser(value_parser!(String))
         )
         .arg(
-            arg!(--color <COLOR> "specify a color to modify in the color palette, explicit colors always take precedence")
-                .id("COLOR")
-                .required_unless_present("COLOR_SCHEME")
-                .value_parser(parse_base_color)
-                .value_terminator(";")
-        )
-        .arg(
             arg!(--color_scheme <COLOR_SCHEME> "specify a json file containing a color scheme")
                 .id("COLOR_SCHEME")
-                .required_unless_present("COLOR")
                 .value_parser(value_parser!(PathBuf))
         )
         .get_matches();
@@ -108,39 +69,22 @@ fn load_color_scheme(matches: &ArgMatches) -> ColorScheme {
         if let Ok(json_str) = std::fs::read_to_string(colors_json) {
             if let Ok(json) = json::parse(&json_str) {
                 for (name, color) in json.entries() {
-                    // `value` is required.
-                    let value = color["value"].as_str().unwrap();
+                    // `value` or `link` are required.
+                    let value = color["value"].as_str()
+                        .or(color["link"].as_str())
+                        .expect("expected `link` or `value`");
                     // `stop` is optional and defaults to 500 if not present.
                     let stop  = color.has_key("stop")
                         .then(|| color["stop"].as_u32().unwrap())
                         .unwrap_or(500);
-                    // `l_min` is optional and defaults to 0 if not present.
-                    let l_min = color.has_key("l_min")
-                        .then(|| color["l_min"].as_u32().unwrap())
-                        .unwrap_or(0);
-                    // `l_max` is optional and defaults to 100 if not present.
-                    let l_max = color.has_key("l_max")
-                        .then(|| color["l_max"].as_u32().unwrap())
-                        .unwrap_or(100);
 
                     scheme.colors.push(BaseColor {
                         name    : name.to_owned(),
                         value   : value.to_owned(),
                         stop    : stop,
-                        l_min   : l_min,
-                        l_max   : l_max
                     })
                 }
             }
-        }
-    }
-
-    // Read out the colors from the command line and build a scheme.
-    //
-    // Command line colors always take precedence.
-    if let Some(colors) = matches.get_many::<BaseColor>("COLOR") {
-        for color in colors {
-            scheme.colors.push(color.clone());
         }
     }
 
@@ -157,129 +101,65 @@ struct ColorScheme {
 struct BaseColor {
     /// The name of the color.
     name    : String,
-    /// The hexadecimal value of the color.
+    /// The hexadecimal value of the color or the name of a color to link to.
     value   : String,
     /// The stop the color starts at.
     stop    : u32,
-    /// The minimum lightness value for the base color.
-    l_min   : u32,
-    /// The maximum lightness value for the base color.
-    l_max   : u32,
 }
 
-/// The maximum stops we compute.
-const MAX_STOPS         : usize
-    = 9;
-/// The stops used for computing the color distribution.
-const DISTRIBUTION_STOPS: [u32; MAX_STOPS + 4]
-    = [0, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950, 1000];
-/// The stops we actually want to emit.
-const STOPS             : [u32; MAX_STOPS]
-    = [100, 200, 300, 400, 500, 600, 700, 800, 900];
+/// The stops to emit for the color.
+const STOPS : &'static [u32]
+    = &[100, 200, 300, 400, 500, 600, 700, 800, 900];
 
 impl BaseColor {
-    /// Create a new base color for a color scheme update.
-    fn new(name: &str, value: &str, stop: u32) -> Self {
-        Self {
-            name    : name.to_owned(),
-            value   : value.to_owned(),
-            stop    : stop,
-            l_min   : 0,
-            l_max   : 100
-        }
-    }
-
     /// Create a color from a base color.
-    fn create_tints(&self, group: &str) -> Result<ColorTints, Error> {
-        // Logic derived from https://github.com/SimeonGriggs/tints.dev/blob/main/app/lib/createSwatches.ts#L13.
-        let (h, s, l)       = hex_to_hsl(&self.value)?;
-        let max             = self.l_max as f64;
-        let min             = self.l_min as f64;
-        let distribution    = self.create_distribution(max, min, l, self.stop);
-
-        let mut tints = Vec::with_capacity(MAX_STOPS);
-        for (i, stop) in STOPS.iter().enumerate() {
-            let new_h   = h.rem_euclid(360.0);
-            let new_s   = s.clamp(0.0, 100.0);
-            let new_l   = distribution[i].clamp(0.0, 100.0);
-
-            let new_hex = hsl_to_hex(new_h, new_s, new_l);
-
-            let color   = Color {
-                id      : Uuid::new_v4(),
-                version : 1,
-                name    : format!("{group} / {} / {}.{stop}", self.name, self.name),
-                value   : new_hex
-            };
-
-            tints.push(color);
-        }
+    fn create_tints(&self, group: &str) -> Result<Vec<Color>, Error> {
+        let (r, g, b)   = hex_to_rgb(&self.value)?;
+        let mid         = (STOPS.len() - 1) / 2;
+        let max         = 0.8;
         
-        Ok(ColorTints { name: self.name.clone(), tints })
-    }
+        let mut tints = Vec::with_capacity(STOPS.len());
+        for (i, stop) in STOPS.iter().enumerate() {
+            let hex;
 
-    /// Create a lightness distribution for the base color.
-    fn create_distribution(&self, min: f64, max: f64, lightness: f64, stop: u32) -> Vec<f64> {
-        /// Find the indenx of `stop` in `stops`.
-        fn index_of(stop: u32) -> f64 {
-            DISTRIBUTION_STOPS.iter()
-                .position(|x| *x == stop)
-                .map(|x| x as f64)
-                .unwrap_or(-1.0)
-        }
-
-        let mut stops   = Vec::with_capacity(MAX_STOPS + 4);
-        let mut tweaks  = Vec::with_capacity(MAX_STOPS + 4);
-        stops.push(0);      tweaks.push(max);
-        stops.push(stop);   tweaks.push(lightness);
-        stops.push(1000);   tweaks.push(min);
-
-        for i in 0..DISTRIBUTION_STOPS.len() {
-            let stop_value = DISTRIBUTION_STOPS[i];
-
-            // Skip any stops we don't care about. We can't remove them from the array 
-            // because it breaks the math but we can enforce that they don't end up in
-            // the output.
-            match stop_value {
-                0 | 1000        => continue,
-                x if x == stop  => continue,
-                _               => ()
-            }
-            
-            let diff    = ((stop_value as f64 - stop as f64) / 100.0).abs();
-
-            let total;
-            let increment;
-            let tweak;
-            
-            if stop_value < stop {
-                total       = (index_of(stop) - index_of(DISTRIBUTION_STOPS[0])).abs() - 1.0;
-                increment   = max - lightness;
-                tweak       = (increment / total) * diff + lightness;
+            if *stop == self.stop {
+                hex = self.value.clone();
             }
             else {
-                total       = (index_of(stop) - index_of(DISTRIBUTION_STOPS[DISTRIBUTION_STOPS.len() - 1])).abs() - 1.0;
-                increment   = lightness - min;
-                tweak       = lightness - (increment / total) * diff;
+                let t;
+                let dst;
+    
+                if i < mid {
+                    t   = (mid - i) as f64 / mid as f64;
+                    dst = 1.0;
+                }
+                else {
+                    t   = (i - mid) as f64 / mid as f64;
+                    dst = 0.0;
+                };
+    
+                let t       = max * t;
+                let new_r   = lerp(r, dst, t);
+                let new_g   = lerp(g, dst, t);
+                let new_b   = lerp(b, dst, t);
+    
+                hex         = rgb_to_hex(new_r, new_g, new_b);
             }
 
-            stops.push(stop_value);
-            tweaks.push(tweak.round());
-        }
+            let name_stem = self.name.split('/')
+                .last()
+                .unwrap()
+                .trim();
 
-        let mut indices = (0..stops.len()).collect::<Vec<_>>();
-        indices.sort_by_key(|i| stops[*i]);
-        indices.reverse();
-        sort_by_indices(tweaks.len(), &mut indices, |a, b| tweaks.swap(a, b));
+            tints.push(Color {
+                id      : Uuid::new_v4(),
+                version : 1,
+                name    : format!("{group} / {} / {name_stem}.{stop}", self.name),
+                value   : hex
+            });
+        }
         
-        // Remove 0 and 50, we don't care about them but need them for the algorithm
-        // to work correctly.
-        tweaks.remove(0);
-        tweaks.remove(0);
-        // Likewise remove 950 and 100, we don't need them either.
-        tweaks.pop();
-        tweaks.pop();
-        tweaks
+        Ok(tints)
     }
 }
 
@@ -287,61 +167,36 @@ impl BaseColor {
 #[derive(Default)]
 struct ColorPalette {
     /// The set of colors in a color palette.
-    colors  : Vec<ColorTints>,
+    colors: BTreeMap<String, Color>
 }
 
 impl ColorPalette {
-    /// Find an exiting color in the palette, creating it if missing.
-    fn find_or_insert(&mut self, name: &str) -> &mut ColorTints {
-        for i in 0..self.colors.len() {
-            if self.colors[i].name.as_str() == name {
-                return &mut self.colors[i];
-            }
+    /// Update a color in the palette by name, updating the existing color or creating a new
+    /// one if missing.
+    fn update_by_name(&mut self, color: Color) {
+        if let Some(x) = self.colors.get_mut(&color.name) {
+            x.version  += 1;
+            x.value     = color.value.clone();
         }
-        
-        let tints = ColorTints {
-            name    : name.to_owned(),
-            tints   : Vec::new()
-        };
-
-        self.colors.push(tints);
-        self.colors.last_mut().unwrap()
-    }
-}
-
-/// A set of tints for a single color in a palette.
-#[derive(Default)]
-struct ColorTints {
-    /// The name of the color.
-    name : String,
-    /// The various tints for the color.
-    tints: Vec<Color>,
-}
-
-impl ColorTints {
-    /// Add a new color entry 
-    fn push(&mut self, color: Color) {
-        self.tints.push(color);
+        else {
+            self.colors.insert(color.name.to_owned(), color);
+        }
     }
 
-    /// Update the colors in `self` by name matching so their ids are preserved.
-    fn update_by_name(&mut self, other: &mut Self) {
-        for new in other.tints.drain(..) {
-            let exact_name = new.name.split('/')
-                .last()
-                .unwrap();
+    /// Link in a color to an existing color by name.
+    fn link_by_name(&mut self, color: &BaseColor, group: &str) {
+        let term = format!("{group} / {}", color.value);
+        match self.colors.get(&term) {
+            None        => panic!("color {} not found in palette", color.value),
+            Some(src)   => {
+                let color = Color {
+                    id      : Uuid::new_v4(),
+                    version : 1,
+                    name    : format!("{group} / {}", color.name),
+                    value   : src.value.clone()
+                };
 
-            let old = self.tints.iter_mut()
-                .find(|x| x.name.ends_with(exact_name));
-
-            // If a color exists with the old name we can update the value in-place.
-            if let Some(old) = old {
-                old.version += 1;
-                old.value    = new.value;
-            }
-            // Otherwise we need to add a new color.
-            else {
-                self.tints.push(new);
+                self.update_by_name(color);
             }
         }
     }
@@ -361,8 +216,8 @@ struct Color {
 }
 
 impl Color {
-    // Create a new color from a json representation.
-    fn from_json(json: &JsonValue) -> Color {
+    // Create a new color from a json representation, filtering by prefix..
+    fn from_json(json: &JsonValue, prefix: &str) -> Option<Color> {
         /// Decode a uuid from a lunacy id.
         fn decode_id(id: &str) -> Uuid {
             let bytes = URL_SAFE_NO_PAD.decode(id).unwrap();
@@ -372,12 +227,27 @@ impl Color {
             uuid
         }
 
-        Color {
+        let name = json["name"].as_str()
+            .unwrap();
+
+        if !name.starts_with(prefix) {
+            return None;
+        }
+
+        let name = name
+            .strip_prefix(&prefix)
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap()
+            .trim();
+
+        Some(Color {
             id      : decode_id(json["id"].as_str().unwrap()),
             version : json["version"].as_u32().unwrap_or(1),
-            name    : json["name"].as_str().unwrap().to_owned(),
+            name    : name.to_owned(),
             value   : json["value"].as_str().unwrap().to_owned()
-        }
+        })
     }
 
     /// Format the color as a JSON string.
@@ -440,14 +310,20 @@ impl LunacyDocument {
         let mut json    = self.load_json("document.json")?;
         let mut palette = Self::parse_color_palette(&json, group);
 
+        eprintln!("generate");
+
         // Modify or extend the color palette as requested by the user.
         for base_color in scheme.colors.iter() {
-            // Acquire the tints from `tints.dev`.
-            let mut new_tints   = base_color.create_tints(group)?;
-            let tints           = palette.find_or_insert(&base_color.name);
-
-            // Update the tints in the palette by name.
-            tints.update_by_name(&mut new_tints);
+            // Values with a hashtag are generative colors.
+            if base_color.value.starts_with("#") {
+                for color in base_color.create_tints(group)? {
+                    palette.update_by_name(color);
+                }
+            }
+            // Otherwise they're link colors.
+            else {
+                palette.link_by_name(&base_color, group);
+            }
         }
 
         // Apply changes back to the JSON file.
@@ -486,24 +362,12 @@ impl LunacyDocument {
         let prefix          = format!("{group} / ");
         for i in 0..color_variables.len() {
             let color_var   = &color_variables[i];
-            let color       = Color::from_json(&color_var);
-
-            // Skip any colors not in the desired group.
-            if !color.name.starts_with(&prefix) {
+            let Some(color) = Color::from_json(&color_var, &prefix) else {
                 continue;
-            } 
-
-            // Get the plain color name without the prefix or suffix.
-            let color_name = color.name.strip_prefix(&prefix)
-                .unwrap()
-                .split('/')
-                .next()
-                .unwrap()
-                .trim();
+            };
 
             // Add the color to the list.
-            palette.find_or_insert(color_name)
-                .push(color);
+            palette.colors.insert(color.name.clone(), color);
         }
 
         palette
@@ -517,12 +381,15 @@ impl LunacyDocument {
     )
         -> Result<(), Error>
     {
+        eprintln!("apply");
         let JsonValue::Array(color_variables) = &mut json["colorVariables"] else {
             return Ok(());
         };
 
+        eprintln!("remove");
+
         // Remove the old colors from the variable list.
-        for color in palette.colors.iter() {
+        for color in palette.colors.values() {
             // Remove any variables that start with our colors.
             let prefix = format!("{group} / {}", color.name);
             let mut i  = 0;
@@ -536,98 +403,27 @@ impl LunacyDocument {
             }
         }
 
+        eprintln!("insert");
+
         // Now insert the updated colors.
-        for color in palette.colors.iter() {
-            for tint in color.tints.iter() {
-                color_variables.push(tint.to_json_obj()?);
-            }
+        for color in palette.colors.values() {
+            println!("{} -> {}", color.name, color.value);
+            color_variables.push(color.to_json_obj()?);
         }
 
         Ok(())
     }
 }
 
-/// Reorder an external sequence given a sorted vector of `indices` representing the current 
-/// positions of each element in the input.
-/// 
-/// For example, to sort a vector of elements by an external key.
-/// ```
-/// # use core_algo::sort_by_indices;
-/// let mut data    = ["a", "c", "b", "d"];
-/// let mut indices = {
-///     let mut indices = (0..data.len()).collect::<Vec<_>>();
-///     indices.sort_by_key(|&i| &data[i]);
-///     indices
-/// };
-/// 
-/// sort_by_indices(|x, y| data.swap(x, y), &mut indices);
-/// ```
-/// While not very useful for single vectors, this can be useful for sorting sets of parallel
-/// vectors where the element at `i` each vector needs to occupy the same index in all vectors.
-/// 
-/// # Arguments
-/// * `len`     - The length of the sequence being sorted.
-/// * `indices` - A pre-sorted set of indices where each element represents the current position of the element.
-/// * `swap`    - A swap function called each time a pair of elements in the sequence is moved.
-pub fn sort_by_indices<F>(len: usize, indices: &mut Vec<usize>, mut swap: F)
-    where F: FnMut(usize, usize)
-{
-    for idx in 0..len {
-        if indices[idx] != idx {
-            let mut current_idx = idx;
-            loop { 
-                let target_idx          = indices[current_idx];
-                indices[current_idx]    = current_idx;
-
-                if indices[target_idx] == target_idx {
-                    break;
-                }
-
-                swap(current_idx, target_idx);
-
-                current_idx = target_idx;
-            }
-        }
-    }
-}
-
-/// Parse a hex value to an HSL tuple.
-fn hex_to_hsl(value: &str) -> Result<(f64, f64, f64), Error> {
-    let (mut r, mut g, mut b) = hex_to_rgb(value)?;
-
-    r          /= 255.0;
-    g          /= 255.0;
-    b          /= 255.0;
-
-    let cmin    = r.min(g).min(b);
-    let cmax    = r.max(g).max(b);
-    let delta   = cmax - cmin;
-
-    let mut h;
-    let mut s;
-    let mut l;
-
-    if      delta == 0.0 { h = 0.0; }
-    else if cmax  == r   { h = ((g - b) / delta).rem_euclid(6.0); }
-    else if cmax  == g   { h = (b - r) / delta + 2.0;   }
-    else                 { h = (r - g) / delta + 4.0;   }
-
-    h = (h * 60.0).round();
-
-    if h < 0.0 { h += 360.0; }
-
-    l = (cmax + cmin) / 2.0;
-    s = if delta == 0.0 { 0.0 } else { delta / (1.0 - (2.0 * l - 1.0).abs()) };
-    s = s * 100.0;
-    l = l * 100.0;
-
-    Ok((h, s, l))
+/// Linearly interpolate from a -> b by `t`.
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a * (1.0 - t) + b * t
 }
 
 /// Parse a hex value to an RGB tuple.
 fn hex_to_rgb(value: &str) -> Result<(f64, f64, f64), Error> {
     // We expect either #RRGGBB format only.
-    if value.len() != 7 {
+    if value.len() != 7 && value.len() != 9 {
         return Err(Box::new(ColorParseError::InvalidFormat));
     }
 
@@ -637,72 +433,30 @@ fn hex_to_rgb(value: &str) -> Result<(f64, f64, f64), Error> {
     }
 
     // Parse the hex value.
-    let hex = u32::from_str_radix(&value[1..], 16)?;
+    let mut hex = u32::from_str_radix(&value[1..], 16)?;
 
-    let b = hex >> 0  & 0xff;
-    let g = hex >> 8  & 0xff;
-    let r = hex >> 16 & 0xff;
+    // Shift over by 8 and add FF to account for the alpha channel
+    // in #RRGGBB formats.
+    if value.len() != 9 {
+        hex <<= 8;
+        hex  |= 0xff;
+    }
 
-    Ok((r as f64, g as f64, b as f64))
+    let b = (hex >> 8  & 0xff)  as f64 / 255.0;
+    let g = (hex >> 16  & 0xff) as f64 / 255.0;
+    let r = (hex >> 24 & 0xff)  as f64 / 255.0;
+
+    Ok((r, g, b))
 }
 
-/// Convert HSL to hex.
-fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
-    let (r, g, b) = hsl_to_rgb(h, s, l);
+/// Convert RGB to hex.
+fn rgb_to_hex(r: f64, g: f64, b: f64) -> String {
+    let r         = (r * 255.0).round() as u32;
+    let g         = (g * 255.0).round() as u32;
+    let b         = (b * 255.0).round() as u32;
     let value     = (r << 16) | (g << 8) | (b << 0);
-
+    
     format!("{:06x}", value)
-}
-
-/// Convert HSL to RGB.
-fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u32, u32, u32) {
-    let s = s.clamp(0.0, 100.0) / 100.0;
-    let l = l.clamp(0.0, 100.0) / 100.0;
-
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
-    let x = c * (1.0 - (((h / 60.0).rem_euclid(2.0)) - 1.0).abs());
-    let m = l - c / 2.0;
-
-    let mut r = 0.0;
-    let mut g = 0.0;
-    let mut b = 0.0;
-
-    if h >= 0.0 && h < 60.0 {
-        r = c;
-        g = x;
-        b = 0.0;
-    }
-    else if h >= 60.0 && h < 120.0 {
-        r = x;
-        g = c;
-        b = 0.0;
-    }
-    else if h >= 120.0 && h < 180.0 {
-        r = 0.0;
-        g = c;
-        b = x;
-    }
-    else if h >= 180.0 && h < 240.0 {
-        r = 0.0;
-        g = x;
-        b = c;
-    }
-    else if h >= 240.0 && h < 300.0 {
-        r = x;
-        g = 0.0;
-        b = c;
-    }
-    else if h >= 300.0 && h < 360.0 {
-        r = c;
-        g = 0.0;
-        b = x;
-    }
-
-    (
-        ((r + m) * 255.0).round() as u32,
-        ((g + m) * 255.0).round() as u32,
-        ((b + m) * 255.0).round() as u32,
-    )
 }
 
 /// An error raised when parsing a color value from a string.
