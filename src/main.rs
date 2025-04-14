@@ -113,35 +113,33 @@ const STOPS : &'static [u32]
 
 impl BaseColor {
     /// Create a color from a base color.
-    fn create_tints(&self, group: &str) -> Result<Vec<Color>, Error> {
+    fn create_tints(&self) -> Result<Vec<Color>, Error> {
         let (r, g, b)   = hex_to_rgb(&self.value)?;
-        let mid         = (STOPS.len() - 1) / 2;
-        let max         = 0.8;
+        let pivot       = STOPS.iter().position(|x| *x == self.stop).unwrap_or(500);
         
         let mut tints = Vec::with_capacity(STOPS.len());
         for (i, stop) in STOPS.iter().enumerate() {
             let hex;
 
             if *stop == self.stop {
-                hex = self.value.clone();
+                hex = self.value.to_owned();
             }
             else {
                 let t;
                 let dst;
     
-                if i < mid {
-                    t   = (mid - i) as f64 / mid as f64;
+                if i < pivot {
+                    t   = (pivot - i) as f64 / pivot as f64;
                     dst = 1.0;
                 }
                 else {
-                    t   = (i - mid) as f64 / mid as f64;
+                    t   = (i - pivot) as f64 / (STOPS.len() - pivot) as f64;
                     dst = 0.0;
                 };
-    
-                let t       = max * t;
-                let new_r   = lerp(r, dst, t);
-                let new_g   = lerp(g, dst, t);
-                let new_b   = lerp(b, dst, t);
+                
+                let new_r   = lerp(r, dst, t * 0.8);
+                let new_g   = lerp(g, dst, t * 0.8);
+                let new_b   = lerp(b, dst, t * 0.8);
     
                 hex         = rgb_to_hex(new_r, new_g, new_b);
             }
@@ -154,7 +152,7 @@ impl BaseColor {
             tints.push(Color {
                 id      : Uuid::new_v4(),
                 version : 1,
-                name    : format!("{group} / {} / {name_stem}.{stop}", self.name),
+                name    : format!("{} / {name_stem}.{stop}", self.name),
                 value   : hex
             });
         }
@@ -184,15 +182,14 @@ impl ColorPalette {
     }
 
     /// Link in a color to an existing color by name.
-    fn link_by_name(&mut self, color: &BaseColor, group: &str) {
-        let term = format!("{group} / {}", color.value);
-        match self.colors.get(&term) {
+    fn link_by_name(&mut self, color: &BaseColor) {
+        match self.colors.get(&color.value) {
             None        => panic!("color {} not found in palette", color.value),
             Some(src)   => {
                 let color = Color {
                     id      : Uuid::new_v4(),
                     version : 1,
-                    name    : format!("{group} / {}", color.name),
+                    name    : color.name.clone(),
                     value   : src.value.clone()
                 };
 
@@ -230,28 +227,20 @@ impl Color {
         let name = json["name"].as_str()
             .unwrap();
 
-        if !name.starts_with(prefix) {
+        let Some(name) = name.strip_prefix(prefix) else {
             return None;
-        }
-
-        let name = name
-            .strip_prefix(&prefix)
-            .unwrap()
-            .split('/')
-            .next()
-            .unwrap()
-            .trim();
+        };
 
         Some(Color {
             id      : decode_id(json["id"].as_str().unwrap()),
             version : json["version"].as_u32().unwrap_or(1),
-            name    : name.to_owned(),
-            value   : json["value"].as_str().unwrap().to_owned()
+            name    : name.trim().to_owned(),
+            value   : format!("#{}", json["value"].as_str().unwrap())
         })
     }
 
     /// Format the color as a JSON string.
-    fn to_json_obj(&self) -> Result<JsonValue, Error> {
+    fn to_json_obj(&self, group: &str) -> Result<JsonValue, Error> {
         /// Encode a uuid to a lunacy id.
         fn encode_id(id: &Uuid) -> String {
             URL_SAFE_NO_PAD.encode(id.as_bytes())
@@ -260,8 +249,8 @@ impl Color {
         Ok(object! {
             "id"        : encode_id(&self.id),
             "version"   : self.version,
-            "name"      : self.name.as_str(),
-            "value"     : self.value.as_str(),
+            "name"      : format!("{group} / {}", self.name.as_str()),
+            "value"     : &self.value.as_str()[1..],
         })
     }
 }
@@ -310,19 +299,17 @@ impl LunacyDocument {
         let mut json    = self.load_json("document.json")?;
         let mut palette = Self::parse_color_palette(&json, group);
 
-        eprintln!("generate");
-
         // Modify or extend the color palette as requested by the user.
         for base_color in scheme.colors.iter() {
             // Values with a hashtag are generative colors.
             if base_color.value.starts_with("#") {
-                for color in base_color.create_tints(group)? {
+                for color in base_color.create_tints()? {
                     palette.update_by_name(color);
                 }
             }
             // Otherwise they're link colors.
             else {
-                palette.link_by_name(&base_color, group);
+                palette.link_by_name(&base_color);
             }
         }
 
@@ -359,7 +346,7 @@ impl LunacyDocument {
         let color_variables = &json["colorVariables"];
         let mut palette     = ColorPalette::default();
 
-        let prefix          = format!("{group} / ");
+        let prefix          = format!("{group} /");
         for i in 0..color_variables.len() {
             let color_var   = &color_variables[i];
             let Some(color) = Color::from_json(&color_var, &prefix) else {
@@ -381,18 +368,22 @@ impl LunacyDocument {
     )
         -> Result<(), Error>
     {
-        eprintln!("apply");
+        if !json.has_key("colorVariables") || !json["colorVariables"].is_array() {
+            json.insert("colorVariables", Vec::<JsonValue>::new())
+                .unwrap();
+        }
+
         let JsonValue::Array(color_variables) = &mut json["colorVariables"] else {
             return Ok(());
         };
 
-        eprintln!("remove");
-
         // Remove the old colors from the variable list.
         for color in palette.colors.values() {
             // Remove any variables that start with our colors.
-            let prefix = format!("{group} / {}", color.name);
-            let mut i  = 0;
+            let term    = color.name.split('/').next().unwrap().trim();
+            let prefix  = format!("{group} / {term}");
+
+            let mut i   = 0;
             while i < color_variables.len() {
                 if color_variables[i]["name"].as_str().unwrap().starts_with(&prefix) {
                     color_variables.remove(i);
@@ -403,12 +394,9 @@ impl LunacyDocument {
             }
         }
 
-        eprintln!("insert");
-
         // Now insert the updated colors.
         for color in palette.colors.values() {
-            println!("{} -> {}", color.name, color.value);
-            color_variables.push(color.to_json_obj()?);
+            color_variables.push(color.to_json_obj(group)?);
         }
 
         Ok(())
@@ -456,7 +444,7 @@ fn rgb_to_hex(r: f64, g: f64, b: f64) -> String {
     let b         = (b * 255.0).round() as u32;
     let value     = (r << 16) | (g << 8) | (b << 0);
     
-    format!("{:06x}", value)
+    format!("#{:06x}", value)
 }
 
 /// An error raised when parsing a color value from a string.
